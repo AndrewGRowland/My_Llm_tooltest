@@ -6,7 +6,7 @@ from collections import defaultdict
 
 
 class ToolCallTracker:
-    def __init__(self, max_tokens=50000, warning_threshold=0.8, hard_threshold=0.9):
+    def __init__(self, max_tokens=128000, warning_threshold=0.8, hard_threshold=0.9):
         self.max_tokens = max_tokens
         self.warning_threshold = warning_threshold
         self.hard_threshold = hard_threshold
