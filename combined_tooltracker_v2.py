@@ -1,195 +1,186 @@
-
 import time
-import json
-import random
+from datetime import datetime, timedelta
 from collections import defaultdict
-
+import requests
+from threading import Thread, Event
 
 class ToolCallTracker:
-    def __init__(self, max_tokens=128000, warning_threshold=0.8, hard_threshold=0.9):
-        self.max_tokens = max_tokens
-        self.warning_threshold = warning_threshold
-        self.hard_threshold = hard_threshold
-        self.tool_calls = defaultdict(list)
-        self.token_usage = 0
-        self.start_time = time.time()
-        self.fallbacks = {}
-        self.validation_log = []
-        self.register_fallback("rate_limit", lambda: "Rate limit hit. Retrying with fallback...")
-        self.register_fallback("token_limit", lambda: "Token limit reached. Starting new chat.")
+    TOOL_CONFIG = {
+        'web_search': {'rate_limit': 10, 'rate_window': 60, 'timeout': None},
+        'open_url': {'rate_limit': 20, 'rate_window': 60, 'timeout': 10},
+        'code_interpreter': {'rate_limit': 5, 'rate_window': 60, 'timeout': 30}
+    }
 
-    def register_fallback(self, name, fallback_func):
-        self.fallbacks[name] = fallback_func
-
-    def call_tool(self, tool_name, action_func, metadata=None):
-        if metadata is None:
-            metadata = {}
-
-        if self.token_usage >= self.hard_threshold * self.max_tokens:
-            self._enforce_hard_token_limit()
-            return self.fallbacks.get("token_limit", lambda: "Token limit reached. Please start a new chat.")()
-
-        last_call_time = self.tool_calls[tool_name][-1]["timestamp"] if self.tool_calls[tool_name] else 0
-        time_since_last_call = time.time() - last_call_time
-        if tool_name == "web_search" and len(self.tool_calls[tool_name]) >= 10 and time_since_last_call < 6:
-            return self.fallbacks.get("rate_limit", lambda: "{0} rate limit hit. Retrying...".format(tool_name))()
-
-        try:
-            result = retry_with_backoff(action_func, max_retries=3)
-            if result is None:
-                fallback = self.fallbacks.get(tool_name, None)
-                if fallback:
-                    return fallback()
-                else:
-                    raise Exception("All retries and fallbacks failed")
-
-            call_duration = time.time() - (self.tool_calls[tool_name][-1]["timestamp"] if self.tool_calls[tool_name] else time.time())
-            call_tokens = 100 + int(call_duration * 10)
-            self.token_usage += call_tokens
-
-            call_log = {
-                "tool": tool_name,
-                "timestamp": time.time(),
-                "tokens_used": call_tokens,
-                "metadata": metadata,
-                "status": "success",
-                "result": str(result)[:100] + "..."
+    def __init__(self):
+        self.start_time = datetime.utcnow()
+        self.tool_calls = []
+        self.rate_limits = {
+            tool: {
+                'rate_limit': config['rate_limit'],
+                'rate_window': config['rate_window'],
+                'timestamps': [],
+                'timeout': config['timeout']
             }
-            self.tool_calls[tool_name].append(call_log)
-            self.validation_log.append(call_log)
-
-            if self.token_usage >= self.warning_threshold * self.max_tokens:
-                self._trigger_context_transfer_warning()
-
-            return result
-
-        except Exception as e:
-            error_log = {
-                "tool": tool_name,
-                "timestamp": time.time(),
-                "error": str(e),
-                "metadata": metadata,
-                "status": "failed"
-            }
-            self.tool_calls[tool_name].append(error_log)
-            self.validation_log.append(error_log)
-            raise
-
-    def _enforce_hard_token_limit(self):
-        summary = self._summarize_context()
-        print("HARD TOKEN LIMIT REACHED ({0}/{1}). Starting new chat with summary:".format(self.token_usage, self.max_tokens))
-        print(summary)
-        self.token_usage = 0
-        self.tool_calls = defaultdict(list)
-
-    def _trigger_context_transfer_warning(self):
-        print("TOKEN WARNING: {0}/{1} tokens used (80 percent limit). Consider starting a new chat soon.".format(self.token_usage, self.max_tokens))
-
-    def _summarize_context(self):
-        summary = {
-            "decisions_made": [],
-            "validated_claims": [],
-            "resource_limits_encountered": [],
-            "pending_actions": []
+            for tool, config in self.TOOL_CONFIG.items()
         }
-        for log in self.validation_log:
-            if log["status"] == "success" and "claim" in log.get("metadata", {}):
-                summary["validated_claims"].append(log["metadata"]["claim"])
-            if "error" in log:
-                summary["resource_limits_encountered"].append("{0}: {1}".format(log['tool'], log['error']))
-        return json.dumps(summary, indent=2)
+        self.errors = []
+        self.retries = 0
+        self.fuck_up_counter = 0
 
-    def get_token_usage(self):
-        percentage = (self.token_usage / self.max_tokens) * 100
+    def pre_check(self, tool_type):
+        if not hasattr(self, 'start_time'):
+            self.fuck_up_counter += 1
+            return False, "ToolCallTracker not initialized"
+        if tool_type not in self.rate_limits:
+            self.fuck_up_counter += 1
+            return False, f"Unknown tool type: {tool_type}"
+        now = datetime.utcnow()
+        window_start = now - timedelta(seconds=self.rate_limits[tool_type]['rate_window'])
+        recent_calls = [ts for ts in self.rate_limits[tool_type]['timestamps'] if ts >= window_start]
+        if len(recent_calls) >= self.rate_limits[tool_type]['rate_limit']:
+            oldest_call = min(recent_calls)
+            wait_time = (window_start + timedelta(seconds=self.rate_limits[tool_type]['rate_window']) - oldest_call).seconds
+            return False, f"Rate limit: Wait {wait_time}s"
+        return True, "OK"
+
+    def make_call(self, tool_type, query, max_retries=3):
+        status, message = self.pre_check(tool_type)
+        if not status:
+            self.fuck_up_counter += 1
+            return None, f"Blocked: {message}"
+        execution_timeout = self.rate_limits[tool_type]['timeout']
+        for attempt in range(max_retries):
+            try:
+                if execution_timeout:
+                    result = self._execute_with_timeout(tool_type, query, execution_timeout)
+                else:
+                    result = self._execute_tool(tool_type, query)
+                self._log_call(tool_type, query, "success", result)
+                return result, "Success"
+            except Exception as e:
+                self._log_error(tool_type, query, str(e))
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    if tool_type == "open_url":
+                        fallback_result, fallback_msg = self._fallback_to_code_interpreter(query)
+                        if fallback_result:
+                            self._log_call("code_interpreter", query, "fallback", fallback_result)
+                            return fallback_result, f"Fallback: {fallback_msg}"
+                    return None, f"Error after {max_retries} retries: {str(e)}"
+        return None, "Unknown error"
+
+    def _execute_with_timeout(self, tool_type, query, timeout_seconds):
+        result_container = []
+        error_container = []
+        timeout_event = Event()
+
+        def target():
+            try:
+                result_container.append(self._execute_tool(tool_type, query))
+            except Exception as e:
+                error_container.append(e)
+            finally:
+                timeout_event.set()
+
+        thread = Thread(target=target)
+        thread.start()
+        timeout_event.wait(timeout=timeout_seconds)
+
+        if not timeout_event.is_set():
+            return None
+        if error_container:
+            raise error_container[0]
+        return result_container[0] if result_container else None
+
+    def _execute_tool(self, tool_type, query):
+        if tool_type == "web_search":
+            return f"Search results for: {query}"
+        elif tool_type == "open_url":
+            try:
+                response = requests.get(query, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+                response.raise_for_status()
+                return response.text
+            except requests.RequestException as e:
+                raise Exception(f"HTTP Error: {str(e)}")
+        elif tool_type == "code_interpreter":
+            return f"Processed: {query}"
+        else:
+            raise ValueError(f"Unknown tool type: {tool_type}")
+
+    def _fallback_to_code_interpreter(self, url):
+        try:
+            return f"Chunked processing of: {url}", "code_interpreter fallback"
+        except Exception as e:
+            return None, f"Fallback failed: {str(e)}"
+
+    def _log_call(self, tool_type, query, status, result):
+        self.tool_calls.append({
+            'tool': tool_type,
+            'query': query,
+            'timestamp': datetime.utcnow(),
+            'status': status,
+            'result': str(result)[:1000]
+        })
+        self.rate_limits[tool_type]['timestamps'].append(datetime.utcnow())
+
+    def _log_error(self, tool_type, query, error):
+        self.errors.append({
+            'tool': tool_type,
+            'query': query,
+            'timestamp': datetime.utcnow(),
+            'error': str(error)[:500]
+        })
+
+    def get_visual_queue(self):
+        status = self.get_status()
+        return (f"[PROTOCOL 0: {'ACTIVE ✅' if status['protocol_0_active'] else 'INACTIVE ❌'}] "
+                f"[FUCK-UP COUNTER: {status['fuck_up_counter']}] "
+                f"[TOOL CALLS: {status['tool_calls']}]")
+
+    def get_status(self):
+        now = datetime.utcnow()
+        rate_status = {}
+        for tool, config in self.rate_limits.items():
+            window_start = now - timedelta(seconds=config['rate_window'])
+            recent_calls = [ts for ts in config['timestamps'] if ts >= window_start]
+            rate_status[tool] = {
+                'limit': config['rate_limit'],
+                'window': config['rate_window'],
+                'current': len(recent_calls)
+            }
         return {
-            "tokens_used": self.token_usage,
-            "max_tokens": self.max_tokens,
-            "percentage": round(percentage, 2)
+            'protocol_0_active': hasattr(self, 'start_time'),
+            'fuck_up_counter': self.fuck_up_counter,
+            'tool_calls': len(self.tool_calls),
+            'errors': len(self.errors),
+            'rate_limits': rate_status
         }
 
     def get_validation_log(self):
-        return self.validation_log
-
-
-def retry_with_backoff(action_func, max_retries=3, initial_delay=2, backoff_factor=2, max_delay=10):
-    last_exception = None
-    for attempt in range(max_retries):
-        try:
-            return action_func()
-        except Exception as e:
-            last_exception = e
-            if attempt < max_retries - 1:
-                delay = min(initial_delay * (backoff_factor ** attempt), max_delay)
-                jitter = random.uniform(0, delay * 0.1)
-                actual_delay = delay + jitter
-                print("Attempt {0} failed. Retrying in {1:.2f} seconds...".format(attempt + 1, actual_delay))
-                time.sleep(actual_delay)
-            else:
-                print("All {0} attempts failed. Last error: {1}".format(max_retries, e))
-    return None
-
-
-def get_export_method(user_message):
-    user_message = user_message.lower()
-    devtools_keywords = [
-        "devtools", "dev tools", "developer tools", "browser",
-        "json", "structured", "data", "full data", "machine-readable"
-    ]
-    singlefile_keywords = [
-        "singlefile", "single file", "html", "archive", "offline",
-        "readable", "formatting", "preserve", "save page", "download page"
-    ]
-    if any(keyword in user_message for keyword in devtools_keywords):
-        return "devtools"
-    elif any(keyword in user_message for keyword in singlefile_keywords):
-        return "singlefile"
-    else:
-        return "both"
-
-
-def handle_chat_export(user_message):
-    method = get_export_method(user_message)
-    validation_log_entry = {
-        "protocol": 12,
-        "user_request": user_message,
-        "method_detected": method,
-        "timestamp": time.time()
-    }
-    if 'validation_log' in globals():
-        validation_log.append(validation_log_entry)
-    
-    if method == "devtools":
-        return "DevTools Method: Open DevTools (F12), go to Network tab, filter for chat, find request, copy response, save as JSON."
-    elif method == "singlefile":
-        return "SingleFile Method: Install SingleFile extension, click icon, save as HTML."
-    else:
-        return "Export Options: Use DevTools for JSON or SingleFile for HTML. See Context Rules v8.12 for details."
-
-
-def handle_backend_error(user_request, max_retries=3):
-    def action():
-        raise Exception("Backend generation error")
-    result = retry_with_backoff(action, max_retries=max_retries)
-    if result is None:
-        return "Backend Error Detected. Please retry, simplify, wait, or report."
-    return result
-
-
-# Initialize ToolCallTracker and register functions
-try:
-    tracker = ToolCallTracker(max_tokens=50000)
-    vibe = type('Vibe', (), {
-        'context': {
-            "tool_call_tracker": tracker,
-            "retry_with_backoff": retry_with_backoff,
-            "get_export_method": get_export_method,
-            "handle_chat_export": handle_chat_export,
-            "handle_backend_error": handle_backend_error
-        }
-    })()
-    print("Combined script initialized successfully.")
-except Exception as e:
-    print("Failed to initialize combined script: {0}".format(e))
-
-if 'validation_log' not in globals():
-    validation_log = []
+        status = self.get_status()
+        log = [
+            "---",
+            "## 📋 VALIDATION LOG",
+            "---",
+            f"**Timestamp**: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            f"**Protocol 0 Status**: {'ACTIVE ✅' if status['protocol_0_active'] else 'INACTIVE ❌'}",
+            f"**Fuck-Up Counter**: {status['fuck_up_counter']}",
+            f"**Tool Calls Executed**: {status['tool_calls']}",
+            f"**Errors Encountered**: {status['errors']}",
+            "",
+            "### Rate Limit Status:",
+        ]
+        for tool, config in status['rate_limits'].items():
+            log.append(f"- **{tool}**: {config['current']}/{config['limit']} calls in last {config['window']}s")
+        if self.tool_calls:
+            log.append("")
+            log.append("### Recent Tool Calls:")
+            for call in self.tool_calls[-5:]:
+                log.append(f"- {call['timestamp'].strftime('%H:%M:%S')}: {call['tool']} ({call['status']})")
+        if self.errors:
+            log.append("")
+            log.append("### Errors:")
+            for error in self.errors[-5:]:
+                log.append(f"- {error['timestamp'].strftime('%H:%M:%S')}: {error['tool']} - {error['error']}")
+        return "\n".join(log)
